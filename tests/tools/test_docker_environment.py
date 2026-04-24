@@ -258,28 +258,30 @@ def _make_execute_only_env(forward_env=None):
 
 def test_init_env_args_uses_hermes_dotenv_for_allowlisted_env(monkeypatch):
     """_build_init_env_args picks up forwarded env vars from .env file at init time."""
-    env = _make_execute_only_env(["GITHUB_TOKEN"])
+    # Use a var that is NOT in _HERMES_PROVIDER_ENV_BLOCKLIST (GITHUB_TOKEN
+    # is in the copilot provider's api_key_env_vars and gets stripped).
+    env = _make_execute_only_env(["DATABASE_URL"])
 
-    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
-    monkeypatch.setattr(docker_env, "_load_hermes_env_vars", lambda: {"GITHUB_TOKEN": "value_from_dotenv"})
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.setattr(docker_env, "_load_hermes_env_vars", lambda: {"DATABASE_URL": "value_from_dotenv"})
 
     args = env._build_init_env_args()
     args_str = " ".join(args)
 
-    assert "GITHUB_TOKEN=value_from_dotenv" in args_str
+    assert "DATABASE_URL=value_from_dotenv" in args_str
 
 
 def test_init_env_args_prefers_shell_env_over_hermes_dotenv(monkeypatch):
     """Shell env vars take priority over .env file values in init env args."""
-    env = _make_execute_only_env(["GITHUB_TOKEN"])
+    env = _make_execute_only_env(["DATABASE_URL"])
 
-    monkeypatch.setenv("GITHUB_TOKEN", "value_from_shell")
-    monkeypatch.setattr(docker_env, "_load_hermes_env_vars", lambda: {"GITHUB_TOKEN": "value_from_dotenv"})
+    monkeypatch.setenv("DATABASE_URL", "value_from_shell")
+    monkeypatch.setattr(docker_env, "_load_hermes_env_vars", lambda: {"DATABASE_URL": "value_from_dotenv"})
 
     args = env._build_init_env_args()
     args_str = " ".join(args)
 
-    assert "GITHUB_TOKEN=value_from_shell" in args_str
+    assert "DATABASE_URL=value_from_shell" in args_str
     assert "value_from_dotenv" not in args_str
 
 
@@ -380,3 +382,31 @@ def test_normalize_env_dict_rejects_complex_values():
         "BAD_DICT": {"nested": True},
     })
     assert result == {"GOOD": "string"}
+
+
+def test_security_args_include_setuid_setgid_for_gosu_drop():
+    """_SECURITY_ARGS must include SETUID and SETGID so the image entrypoint
+    can drop from root to the non-root `hermes` user via gosu.
+
+    Without these caps gosu exits with
+    ``error: failed switching to 'hermes': operation not permitted``
+    and the container exits immediately (exit 1) before running any work.
+
+    `no-new-privileges` is kept, so gosu still cannot escalate back to root
+    after the drop — the drop is a one-way transition performed before the
+    `no_new_privs` bit is enforced on the exec boundary.
+    """
+    args = docker_env._SECURITY_ARGS
+
+    # Flatten to set of added caps for clarity.
+    added = {
+        args[i + 1]
+        for i, flag in enumerate(args[:-1])
+        if flag == "--cap-add"
+    }
+    assert "SETUID" in added, "SETUID cap missing — gosu drop in entrypoint will fail"
+    assert "SETGID" in added, "SETGID cap missing — gosu drop in entrypoint will fail"
+
+    # Sanity: the hardening posture is still in place.
+    assert "--cap-drop" in args and "ALL" in args
+    assert "--security-opt" in args and "no-new-privileges" in args
